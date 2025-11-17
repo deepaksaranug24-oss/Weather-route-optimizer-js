@@ -1,0 +1,413 @@
+# Weather Route Optimizer (JavaScript)
+
+This repository contains a complete JavaScript project (Node + Express backend + static frontend) that implements a **Weather Route Optimizer** using a graph and Dijkstra's shortest-path algorithm. The project fetches weather for each city (OpenWeatherMap), constructs a weighted graph where edge weights combine geographic distance and weather-based penalties, then computes the optimal route.
+
+---
+
+## File list (in this single-file view)
+
+### package.json
+```json
+{
+  "name": "weather-route-optimizer",
+  "version": "1.0.0",
+  "description": "Route optimizer using weather data + Dijkstra (Node + Express + Static frontend)",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "node-fetch": "^3.4.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
+```
+
+---
+
+### .gitignore
+```
+node_modules/
+.env
+```
+
+---
+
+### README.md
+```markdown
+# Weather Route Optimizer
+
+**Language:** JavaScript (Node.js + Express + static frontend)
+
+This project finds the best route between cities using a combination of geographic distance and live weather penalties. It demonstrates use of: Graph data structure, Dijkstra's algorithm, external APIs (OpenWeatherMap), and a small web UI.
+
+## Features
+- Enter a list of cities
+- Fetch coordinates and current weather for each city from OpenWeatherMap
+- Build a fully-connected graph with edge weights based on distance *and* weather penalty
+- Run Dijkstra to compute lowest-cost route
+- Downloadable results and simple visualization
+
+## Setup
+1. Clone the repo.
+2. Create a file named `.env` at the project root with:
+
+```
+OWM_API_KEY=your_openweathermap_api_key_here
+PORT=3000
+GITHUB_LINK=https://github.com/yourusername
+PROJECT_LINK=https://your-deploy-url
+```
+
+3. Install dependencies:
+```
+npm install
+```
+4. Run the server:
+```
+npm start
+```
+5. Open `http://localhost:3000` in a browser.
+
+## Notes about links
+- When you upload the project to GitHub, set `GITHUB_LINK` in `.env` or replace the placeholder in `README.md` with your profile URL. The grader at NSUT will typically expect a GitHub repo link and a deployed project link (you can deploy on Render, Vercel, or Replit).
+
+## How it works (short)
+- For each city name, the backend calls OpenWeatherMap's current weather API and retrieves `coord` (lat, lon) and weather conditions.
+- It computes pairwise great-circle distances (Haversine).
+- Edge weight = distance * averagePenalty of the two nodes (penalties map from weather condition).
+- Dijkstra finds the min-cost path from chosen start to chosen end.
+
+## What to submit to NSUT
+- GitHub repo link (make sure your repo is public or accessible to the instructor)
+- Deployed app link (optional but recommended)
+- A short report/PPT summarizing algorithm, data structures, API used, and demo steps.
+
+Good luck! If you want, I can also generate the PPT or commit-ready git commands.
+```
+```
+
+---
+
+### src/server.js
+```javascript
+// Simple Express server for Weather Route Optimizer
+import express from 'express';
+import fetch from 'node-fetch';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import dotenv from 'dotenv';
+import { buildGraphAndFindRoute } from './dijkstra.js';
+
+dotenv.config();
+
+const app = express();
+app.use(express.json());
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+app.use(express.static(path.join(__dirname, '..', 'public')));
+
+const OWM_KEY = process.env.OWM_API_KEY;
+if (!OWM_KEY) {
+  console.warn('\nWARNING: No OpenWeatherMap API key found. Create a .env file with OWM_API_KEY=your_key\n');
+}
+
+// Proxy endpoint to fetch weather for a city name
+async function fetchCityWeather(city) {
+  const url = `https://api.openweathermap.org/data/2.5/weather?q=${encodeURIComponent(city)}&appid=${OWM_KEY}`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`OpenWeatherMap error for ${city}: ${res.status} ${txt}`);
+  }
+  const data = await res.json();
+  return {
+    name: data.name,
+    coord: data.coord,
+    weather: data.weather[0],
+    main: data.main
+  };
+}
+
+app.post('/api/route', async (req, res) => {
+  try {
+    const { cities = [], startIndex = 0, endIndex = cities.length - 1 } = req.body;
+    if (!Array.isArray(cities) || cities.length < 2) {
+      return res.status(400).json({ error: 'Provide at least two cities.' });
+    }
+
+    // fetch weather for all cities in parallel
+    const promises = cities.map(c => fetchCityWeather(c).catch(e => ({ error: e.message, query: c })));
+    const results = await Promise.all(promises);
+
+    // check errors
+    const errors = results.filter(r => r && r.error);
+    if (errors.length) {
+      return res.status(400).json({ error: 'Some city lookups failed', details: errors });
+    }
+
+    // Build nodes array
+    const nodes = results.map(r => ({
+      name: r.name,
+      lat: r.coord.lat,
+      lon: r.coord.lon,
+      weather: r.weather,
+      main: r.main
+    }));
+
+    // run the algorithm (dijkstra)
+    const routeResult = buildGraphAndFindRoute(nodes, startIndex, endIndex);
+
+    return res.json({ nodes, routeResult });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Fallback to index for SPA
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, '..', 'public', 'index.html'));
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));
+```
+
+---
+
+### src/dijkstra.js
+```javascript
+// Dijkstra + helper functions
+
+export function haversineDistance(a, b) {
+  const toRad = x => (x * Math.PI) / 180;
+  const R = 6371; // km
+  const dLat = toRad(b.lat - a.lat);
+  const dLon = toRad(b.lon - a.lon);
+  const lat1 = toRad(a.lat);
+  const lat2 = toRad(b.lat);
+
+  const sinDLat = Math.sin(dLat / 2);
+  const sinDLon = Math.sin(dLon / 2);
+  const aa = sinDLat * sinDLat + sinDLon * sinDLon * Math.cos(lat1) * Math.cos(lat2);
+  const c = 2 * Math.atan2(Math.sqrt(aa), Math.sqrt(1 - aa));
+  return R * c; // km
+}
+
+// Simple weather penalty mapping (higher = worse)
+const WEATHER_PENALTIES = {
+  Clear: 1,
+  Clouds: 1.5,
+  Drizzle: 2.5,
+  Rain: 4,
+  Thunderstorm: 8,
+  Snow: 3,
+  Mist: 2,
+  Smoke: 2,
+  Haze: 2,
+  Dust: 2,
+  Fog: 2,
+  Sand: 2,
+  Ash: 2.5,
+  Squall: 5,
+  Tornado: 10
+};
+
+function weatherPenalty(weatherObj) {
+  if (!weatherObj || !weatherObj.main) return 1.8;
+  const key = weatherObj.main;
+  return WEATHER_PENALTIES[key] || 2;
+}
+
+// Build fully connected graph and run Dijkstra
+export function buildGraphAndFindRoute(nodes, startIndex = 0, endIndex = null) {
+  const n = nodes.length;
+  if (endIndex === null) endIndex = n - 1;
+
+  // build adjacency list with weights
+  const adj = Array.from({ length: n }, () => []);
+  for (let i = 0; i < n; i++) {
+    for (let j = i + 1; j < n; j++) {
+      const dist = haversineDistance(nodes[i], nodes[j]); // km
+      const penalty = (weatherPenalty(nodes[i].weather) + weatherPenalty(nodes[j].weather)) / 2;
+      const weight = dist * penalty; // simple combined metric
+      adj[i].push({ to: j, w: weight });
+      adj[j].push({ to: i, w: weight });
+    }
+  }
+
+  // Dijkstra
+  const INF = Number.POSITIVE_INFINITY;
+  const dist = new Array(n).fill(INF);
+  const prev = new Array(n).fill(-1);
+  dist[startIndex] = 0;
+
+  // min-priority queue using simple array (ok for small n)
+  const visited = new Array(n).fill(false);
+  for (let _ = 0; _ < n; _++) {
+    let u = -1;
+    let best = INF;
+    for (let i = 0; i < n; i++) {
+      if (!visited[i] && dist[i] < best) {
+        best = dist[i];
+        u = i;
+      }
+    }
+    if (u === -1) break;
+    visited[u] = true;
+    for (const e of adj[u]) {
+      if (dist[e.to] > dist[u] + e.w) {
+        dist[e.to] = dist[u] + e.w;
+        prev[e.to] = u;
+      }
+    }
+  }
+
+  // reconstruct path
+  if (dist[endIndex] === INF) return { path: [], cost: INF };
+  const path = [];
+  let cur = endIndex;
+  while (cur !== -1) {
+    path.push(cur);
+    cur = prev[cur];
+  }
+  path.reverse();
+
+  return { path, cost: dist[endIndex] };
+}
+```
+
+---
+
+### public/index.html
+```html
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Weather Route Optimizer</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="container">
+    <h1>Weather Route Optimizer</h1>
+    <p>Enter cities (comma separated). Example: Delhi, Mumbai, Jaipur, Agra</p>
+    <textarea id="cities" placeholder="City1, City2, City3" rows="3"></textarea>
+    <div class="row">
+      <label>Start index (0-based): <input id="startIndex" value="0" type="number" min="0" /></label>
+      <label>End index (0-based): <input id="endIndex" value="-1" type="number" min="-1" /></label>
+    </div>
+    <button id="optimize">Find Best Route</button>
+
+    <div id="output"></div>
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>
+```
+
+---
+
+### public/styles.css
+```css
+body { font-family: Arial, Helvetica, sans-serif; background: #f7f9fc; color:#222 }
+.container { width: 760px; max-width: 96%; margin: 30px auto; background: white; padding: 18px; border-radius: 8px; box-shadow: 0 6px 18px rgba(0,0,0,0.08) }
+textarea { width: 100%; font-size: 14px; padding: 8px }
+.row { display:flex; gap:12px; margin:10px 0 }
+#output { margin-top: 18px; white-space: pre-wrap }
+button { padding: 10px 14px; border-radius: 6px; border: none; cursor: pointer }
+```
+
+---
+
+### public/app.js
+```javascript
+async function postJSON(url, body) {
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  return res.json();
+}
+
+function el(id) { return document.getElementById(id); }
+
+el('optimize').addEventListener('click', async () => {
+  const raw = el('cities').value.trim();
+  if (!raw) return alert('Enter city names.');
+  const cities = raw.split(',').map(s => s.trim()).filter(Boolean);
+  const startIndex = Number(el('startIndex').value) || 0;
+  const endInput = Number(el('endIndex').value);
+  const endIndex = endInput === -1 ? cities.length - 1 : endInput;
+
+  el('output').textContent = 'Fetching weather and computing route...';
+  try {
+    const resp = await postJSON('/api/route', { cities, startIndex, endIndex });
+    if (resp.error) {
+      el('output').textContent = 'Error: ' + (resp.error || JSON.stringify(resp));
+      return;
+    }
+
+    const { nodes, routeResult } = resp;
+    const lines = [];
+    lines.push('Nodes (index: name - weather):');
+    nodes.forEach((n, i) => lines.push(`${i}: ${n.name} - ${n.weather.main} (${n.weather.description})`));
+    lines.push('\nOptimized path (indices): ' + routeResult.path.join(' -> '));
+    lines.push('Optimized path (names): ' + routeResult.path.map(i => nodes[i].name).join(' -> '));
+    lines.push('Total route cost (distance * penalty): ' + routeResult.cost.toFixed(2));
+
+    el('output').textContent = lines.join('\n');
+  } catch (err) {
+    el('output').textContent = 'Request failed: ' + err.message;
+  }
+});
+```
+
+---
+
+### Additional files
+- `report.md` — leave as an exercise; include algorithm explanation and complexity (I can generate if you ask)
+- `PPT/` — optional slides (I can create a basic PPT if you want)
+
+---
+
+## How to add your GitHub and Project links (for NSUT submission)
+1. Replace `GITHUB_LINK` and `PROJECT_LINK` placeholders in the `README.md` with your real links.
+2. Commit and push to GitHub:
+
+```bash
+git init
+git add .
+git commit -m "Initial commit: Weather Route Optimizer"
+git branch -M main
+git remote add origin https://github.com/yourusername/weather-route-optimizer.git
+git push -u origin main
+```
+
+3. Deploy (optional):
+- Render.com / Replit / Vercel are great for quick static+node deployments. Pick one and paste the deploy URL into `README.md`.
+
+---
+
+## Quick explanation for the grader (copy to your report)
+- Data structure: Graph represented by adjacency list.
+- Algorithm: Dijkstra's shortest path (O(E log V) with a PQ; here simple array-based queue used for clarity; for large N replace with binary heap).
+- API: OpenWeatherMap current weather API.
+- Edge weight: distance (Haversine) multiplied by average weather penalty.
+
+---
+
+If you'd like: I can now:
+- Generate a ready-to-upload GitHub README with your GitHub link included.
+- Create a short PPT (5 slides) for submission.
+- Convert server to use an environment-free public key pattern for front-end testing (not recommended for public repos).
+
+Tell me which of the above extras you want and I'll produce them next.
